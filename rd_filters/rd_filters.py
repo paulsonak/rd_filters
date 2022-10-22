@@ -9,6 +9,9 @@ import sys
 from rdkit import Chem
 from rdkit.Chem.Descriptors import MolWt, MolLogP, NumHDonors, NumHAcceptors, TPSA
 from rdkit.Chem.rdMolDescriptors import CalcNumRotatableBonds
+from rdkit.Chem.MolStandardize import rdMolStandardize
+from rdkit.Chem import AllChem
+from rdkit.Chem.rdFMCS import FindMCS
 import multiprocessing as mp
 from multiprocessing import Pool
 import time
@@ -17,6 +20,10 @@ import os
 import json
 from docopt import docopt
 import pkg_resources
+import logging
+logging.basicConfig(format='%(asctime)-15s %(message)s')
+logger = logging.getLogger()
+
 
 cmd_str = """Usage:
 rd_filters filter --in INPUT_FILE --prefix PREFIX [--rules RULES_FILE_NAME] [--alerts ALERT_FILE_NAME][--np NUM_CORES]
@@ -164,19 +171,27 @@ class RDFilters:
                 return [smiles, name] + [desc + " > %d" % (max_val)] + desc_list
         return [smiles, name] + ["OK"] + desc_list
 
+##################################################################
+##### AKP modified main() ########################################
+
 def filter_mols(cmd_input, verbose=True):
-    """ A function to replicate the command line in a jupyter notebook.
-    :param cmd_input: input dict of {
-    (template|filter):boolean, 
-    out: a file location for creating a template,
-    in: an input .smi file, 
-    data_path: a path to the directory of alerts and template files, 
-    rules: label for which template file to use, 
-    prefix: an indicator of where to save filtering info and what to call it, 
-    num_cores: number of cores to use with default all cores, 
-    alerts: a file name indicating which alerts to use instead of a template
-    }
-    :return: saves template to out or filter info to prefix
+    """ A function to replicate the command line functionality in a jupyter notebook.
+    Args:
+        cmd_input (dict): input dict of options {
+            (template|filter):boolean, 
+            out: a file location for creating a template,
+            in: an input .smi file, 
+            data_path: a path to the directory of alerts and template files, 
+            rules: label for which template file to use, 
+            prefix: an indicator of where to save filtering info and what to call it, 
+            num_cores: number of cores to use with default all cores, 
+            alerts: a file name indicating which alerts to use instead of a template
+            }
+        verbose (bool): whether to print comments
+    Returns
+        None
+    Effects:
+        Saves template to out or filter info to prefix
     """
     alert_file_name = cmd_input.get("alerts") or pkg_resources.resource_filename('rd_filters', "data/alert_collection.csv")
     rf = RDFilters(alert_file_name)
@@ -240,8 +255,7 @@ def filter_mols(cmd_input, verbose=True):
         
 ##################################################################
 ##################################################################
-
-from atomsci.ddm.utils import rdkit_easy
+##### AKP functions ##############################################
 
 # This function enumerates and scores tautomers for the molecule passed as parameter, puts them in a `pandas.DataFrame` and sorts it by decreasing score.
 # from https://gist.github.com/ptosco/20b06985cd8830d5e549165f6b9fc969
@@ -250,7 +264,7 @@ def get_tautomer_dataframe(mol):
     te.SetMaxTransforms(2000)
     res = te.Enumerate(mol)
     df = pd.DataFrame({"TautSmiles": [Chem.MolToSmiles(t) for t in res], "TautScore": [te.ScoreTautomer(t) for t in res]})
-    PandasTools.AddMoleculeColumnToFrame(df, "TautSmiles")
+    Chem.PandasTools.AddMoleculeColumnToFrame(df, "TautSmiles")
     df.sort_values(by=["TautScore", "TautSmiles"], ascending=[False, True], inplace=True)
     return df
 
@@ -281,7 +295,7 @@ def draw_structures(smiles_dict, corr_smiles_dict, save=False, outdir='./'):
             cormol=Chem.MolFromSmiles('[Na+]')
         mols=[mol,canmol,cormol]
         legends=[root,'Canonical tautomer','Jeff corrected']
-        svg=Draw.MolsToGridImage(mols, legends=legends, molsPerRow=3, subImgSize=(300,300),highlightAtomLists=None, highlightBondLists=None, useSVG=True)
+        svg=AllChem.Draw.MolsToGridImage(mols, legends=legends, molsPerRow=3, subImgSize=(300,300),highlightAtomLists=None, highlightBondLists=None, useSVG=True)
         display(svg)
         if save:
             filename=os.path.join(outdir, f'{root}.svg')
@@ -295,7 +309,10 @@ def draw_filters(filterdict):
         display(mol)
 
 def get_fail_smarts(filter_string, filters):
-    filter_string=filter_string.split(' > ')[0]
+    filter_string=filter_string.split(' > ')
+    if len(filter_string)>2:
+        logger.warning("This molecule has more than one alert, only returning the first one.")
+    filter_string=filter_string[0]
     smarts_list =  filters[filters.description==filter_string].smarts.tolist()
     return smarts_list
 
@@ -319,25 +336,52 @@ def draw_filter_on_mol(smiles, filter_string, filters_df):
         smarts=['']
     substructure = Chem.MolFromSmarts(smarts[0])
     # m=increase_resolution(m, substructure)
-    m.GetSubstructMatches(substructure)
+    matches=m.GetSubstructMatches(substructure)
     return m
 
-def draw_filter_on_mol_df(smiles_col, filter_col, df, filters_df,  mol_col='FilteredMol'):
+def get_filter_df(data_path, rules=['SureChEMBL']):
+    if os.path.isfile(data_path):
+        filter_df=pd.read_csv(data_path)
+    else:
+        filter_df=pd.read_csv(pkg_resources.resource_filename('rd_filters', "data/alert_collection.csv"))
+        if rules[0]!= 'all':
+            filter_df=filter_df[filter_df.rule_set_name.isin(rules)]
+    return filter_df
+
+def add_filtered_mol_col_to_df(df, smiles_col, filter_col, data_path='', rules=['SureChEMBL'], mol_col='FilteredMol'):
+    filter_df=get_filter_df(data_path, rules)
     drawn_mols=[]
+    match_list=[]
     for smiles, filter_string in zip(df[smiles_col], df[filter_col]):
-        mol = draw_filter_on_mol(smiles, filter_string, filters_df)
+        mol = draw_filter_on_mol(smiles, filter_string, filter_df)
         drawn_mols.append(mol)
     df[mol_col]=drawn_mols
     
-def add_filter_col_to_df(filter_col, df, filters_df, mol_col='FilterMol'):
+def add_filter_col_to_df(df, df_filter_col, data_path='', rules=['SureChEMBL'], mol_col='FilterMol'):
+    """ Function to add an image of the filter to your df.
+    Args:
+        df (Pandas.DataFrame): df to add
+        df_filter_col (str): name of the column containing the filter name in df
+        data_path (path): path to list of alerts, either this or rules can be specified. Must be a csv with 'description' matching the filter name and 'smarts' with smarts.
+        rules (list): list of rules sets included in rd_filters package, or ['all']
+        mol_col: name of column containing filter mol image
+    Returns:
+        None
+    Effects:
+        Adds mol_col to df in place.
+    """
+    filter_df=get_filter_df(data_path, rules)               
     filtmols=[]
-    for filter_string in df[filter_col]:
-        smarts=get_fail_smarts(filter_string, filters_df)
+    smartslist=[]
+    for filter_string in df[df_filter_col]:
+        smarts=get_fail_smarts(filter_string, filter_df)
         if len(smarts)==0:
             smarts=['']
         filtmols.append(Chem.MolFromSmarts(smarts[0]))
+        smartslist.append(smarts[0])
+    df['smarts']=smartslist
     df[mol_col]=filtmols
-
+    
 
 ##################################################################
 ##################################################################
