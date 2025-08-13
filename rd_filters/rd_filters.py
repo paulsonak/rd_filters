@@ -14,6 +14,7 @@ from rdkit.Chem import AllChem
 from rdkit.Chem.rdFMCS import FindMCS
 import multiprocessing as mp
 from multiprocessing import Pool
+import itertools
 import time
 import pandas as pd
 import os
@@ -38,12 +39,6 @@ Options:
 --out TEMPLATE_FILE parameter template file name
 """
 
-def get_rules_files(rd_filter_data_path):
-    rules={}
-    for file in os.listdir(rd_filter_data_path):
-        if '.json' in file:
-            rules[file.replace('.json','')]=file
-    return rules
 
 def read_rules(rules_file_name):
     """
@@ -59,6 +54,15 @@ def read_rules(rules_file_name):
             print(f"Error parsing JSON file {rules_file_name}")
             sys.exit(1)
 
+def get_rules_files(rd_filter_data_path):
+    """Get a dictionary of rule names
+    :param rd_filter_data_path: path to the directory of rules files
+    :return: dictionary of rule names"""
+    rules={}
+    for file in os.listdir(rd_filter_data_path):
+        if '.json' in file:
+            rules[file.replace('.json','')]=file
+    return rules
 
 def write_rules(rule_dict, file_name):
     """
@@ -165,11 +169,14 @@ class RDFilters:
             return [smiles, name, 'INVALID', -999, -999, -999, -999, -999, -999]
         desc_list = [MolWt(mol), MolLogP(mol), NumHDonors(mol), NumHAcceptors(mol), TPSA(mol),
                      CalcNumRotatableBonds(mol)]
+        all_res=[]
         for row in self.rule_list:
             patt, max_val, desc = row
             if len(mol.GetSubstructMatches(patt)) > max_val:
-                return [smiles, name] + [desc + " > %d" % (max_val)] + desc_list
-        return [smiles, name] + ["OK"] + desc_list
+                all_res.append([smiles, name] + [desc + " > %d" % (max_val)] + desc_list)
+        if len(all_res) == 0:
+            all_res= [[smiles, name] + ["OK"] + desc_list]
+        return all_res
 
 ##################################################################
 ##### AKP modified main() ########################################
@@ -211,10 +218,10 @@ def filter_mols(cmd_input, verbose=True):
         num_cores = int(num_cores)
 
         if verbose:
-            print("using %d cores" % num_cores, file=sys.stderr)
+            print("Using %d cores" % num_cores, file=sys.stderr)
         start_time = time.time()
         p = Pool(num_cores)
-        input_data = [x.split() for x in open(input_file_name)]
+        input_data = [x.split()[0:2] for x in open(input_file_name)]
         input_data = [x for x in input_data if len(x) == 2]
         rule_dict = read_rules(rules_file_path)
 
@@ -223,8 +230,12 @@ def filter_mols(cmd_input, verbose=True):
         if verbose:
             print(f"Using alerts from {rule_str}", file=sys.stderr)
         rf.build_rule_list(rule_list)
+        # pooled evaluation of all molecules
         res = list(p.map(rf.evaluate, input_data))
+        # reduce list of lists to a single list
+        res=list(itertools.chain.from_iterable(res))
         df = pd.DataFrame(res, columns=["SMILES", "NAME", "FILTER", "MW", "LogP", "HBD", "HBA", "TPSA", "Rot"])
+        # df=df.groupby(['SMILES', 'NAME']).agg({'FILTER': '; '.join, 'MW': 'mean', 'LogP': 'mean', 'HBD': 'mean', 'HBA': 'mean', 'TPSA': 'mean', 'Rot': 'mean'}).reset_index()
         df_ok = df[
             (df.FILTER == "OK") &
             df.MW.between(*rule_dict["MW"]) &
@@ -308,12 +319,15 @@ def draw_filters(filterdict):
         print(label)
         display(mol)
 
-def get_fail_smarts(filter_string, filters):
+def get_fail_smarts(filter_string, filter_set, filters):
     filter_string=filter_string.split(' > ')
     if len(filter_string)>2:
-        logger.warning("This molecule has more than one alert, only returning the first one.")
+        logger.warning(f"This molecule has more than one alert {filter_string}, only returning the first one.")
     filter_string=filter_string[0]
-    smarts_list =  filters[filters.description==filter_string].smarts.tolist()
+    smarts_list =  filters[(filters.description==filter_string)&(filters.rule_set_name.str.lower()==filter_set.lower())].smarts.tolist()
+    if len(smarts_list)>1:
+        logger.warning(f"This filter {filter_string}, {filter_set} has more than one match.")
+        
     return smarts_list
 
 # https://stackoverflow.com/questions/69735586/how-to-highlight-the-substructure-of-a-molecule-with-thick-red-lines-in-rdkit-as
@@ -329,59 +343,68 @@ def increase_resolution(mol, substructure, size=(400, 400)):
     svg = svg.replace('xmlns:svg','xmlns')
     return svg.replace('svg:','')
 
-def draw_filter_on_mol(smiles, filter_string, filters_df):
+def draw_filter_on_mol(smiles, filter_string, filter_set, filters_df):
     m = Chem.MolFromSmiles(smiles)
-    smarts=get_fail_smarts(filter_string, filters_df)
+    smarts=get_fail_smarts(filter_string, filter_set, filters_df)
     if len(smarts)==0:
         smarts=['']
-    substructure = Chem.MolFromSmarts(smarts[0])
-    # m=increase_resolution(m, substructure)
-    matches=m.GetSubstructMatches(substructure)
-    return m
+        matches=[]
+    else:
+        substructure = Chem.MolFromSmarts(smarts[0])
+        # m=increase_resolution(m, substructure)
+        matches=m.GetSubstructMatches(substructure)
+    return m, matches
 
-def get_filter_df(data_path, rules=['SureChEMBL']):
+def get_filter_df(data_path):
     if os.path.isfile(data_path):
         filter_df=pd.read_csv(data_path)
     else:
         filter_df=pd.read_csv(pkg_resources.resource_filename('rd_filters', "data/alert_collection.csv"))
-        if rules[0]!= 'all':
-            filter_df=filter_df[filter_df.rule_set_name.isin(rules)]
     return filter_df
 
-def add_filtered_mol_col_to_df(df, smiles_col, filter_col, data_path='', rules=['SureChEMBL'], mol_col='FilteredMol'):
-    filter_df=get_filter_df(data_path, rules)
-    drawn_mols=[]
-    match_list=[]
-    for smiles, filter_string in zip(df[smiles_col], df[filter_col]):
-        mol = draw_filter_on_mol(smiles, filter_string, filter_df)
-        drawn_mols.append(mol)
-    df[mol_col]=drawn_mols
+def add_filtered_mol_col_to_df(df, smiles_col, filter_col, filter_source_col, data_path='', mol_col='FilteredMol', highlight_col='HighlightAtoms'):    
+    filter_df=get_filter_df(data_path)
+    drawn_mols={}
+    highlights={}
+    df['smifiltsrc']=df[smiles_col]+df[filter_col]+df[filter_source_col]
+    for smiles, filter_string, filter_set in zip(df[smiles_col], df[filter_col], df[filter_source_col]):
+        mol, matches = draw_filter_on_mol(smiles, filter_string, filter_set, filter_df)
+        drawn_mols[smiles+filter_string+filter_set]=mol
+        highlights[smiles+filter_string+filter_set]=[atom_idx for match in matches for atom_idx in match]
+    df[mol_col]=df['smifiltsrc'].map(drawn_mols)
+    df[highlight_col]=df['smifiltsrc'].map(highlights)
+    df.drop(columns=['smifiltsrc'], inplace=True)
+
     
-def add_filter_col_to_df(df, df_filter_col, data_path='', rules=['SureChEMBL'], mol_col='FilterMol'):
+def add_filter_col_to_df(df, filter_col, filter_source_col, data_path='', mol_col='FilterMol'):
     """ Function to add an image of the filter to your df.
     Args:
         df (Pandas.DataFrame): df to add
-        df_filter_col (str): name of the column containing the filter name in df
+        filter_col (str): name of the column containing the filter name in df
+        filter_soure_col (str): name of the column containing the filter source in df
         data_path (path): path to list of alerts, either this or rules can be specified. Must be a csv with 'description' matching the filter name and 'smarts' with smarts.
-        rules (list): list of rules sets included in rd_filters package, or ['all']
         mol_col: name of column containing filter mol image
     Returns:
         None
     Effects:
         Adds mol_col to df in place.
     """
-    filter_df=get_filter_df(data_path, rules)               
-    filtmols=[]
-    smartslist=[]
-    for filter_string in df[df_filter_col]:
-        smarts=get_fail_smarts(filter_string, filter_df)
+    filter_df=get_filter_df(data_path)               
+    filtmols={}
+    smartslist={}
+    for filter_string, filter_set in zip(df[filter_col], df[filter_source_col]):
+        smarts=get_fail_smarts(filter_string, filter_set, filter_df)
         if len(smarts)==0:
+            logger.warning(f"No smarts found for {filter_string}")
             smarts=['']
-        filtmols.append(Chem.MolFromSmarts(smarts[0]))
-        smartslist.append(smarts[0])
-    df['smarts']=smartslist
-    df[mol_col]=filtmols
-    
+        filter_set_string=filter_string+filter_set
+        filtmols[filter_set_string]=Chem.MolFromSmarts(smarts[0])
+        smartslist[filter_set_string]=smarts[0]
+    df['filter_set_string']=df[filter_col]+df[filter_source_col]
+    df['smarts']=df['filter_set_string'].map(smartslist)
+    df[mol_col]=df['filter_set_string'].map(filtmols)
+    df=df.drop(columns=['filter_set_string'])
+
 
 ##################################################################
 ##################################################################
